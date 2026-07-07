@@ -1,1 +1,304 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Optical Zoom Viewer</title>
+  <style>
+    html,body{height:100%;margin:0;background:#0b0b0b;display:flex;align-items:center;justify-content:center}
+    #container{position:relative;width:900px;height:600px;max-width:95vw;max-height:85vh}
+    canvas{width:100%;height:100%;display:block;border-radius:50%;background:#050505}
+    .controls{position:absolute;left:50%;transform:translateX(-50%);bottom:12px;display:flex;gap:8px;align-items:center;background:rgba(0,0,0,0.35);padding:8px 12px;border-radius:999px;color:#eee;font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial}
+    .controls input[type=range]{width:420px}
+    .label{font-size:13px;opacity:0.95}
+    .tip{position:absolute;left:12px;top:12px;color:#ddd;opacity:0.9;font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial}
+    /* small reticle lines */
+    .reticle{position:absolute;left:0;top:0;right:0;bottom:0;pointer-events:none}
+    .reticle::after{content:'';position:absolute;left:50%;top:50%;width:2px;height:2px;background:#fff;transform:translate(-50%,-50%);opacity:0.9;border-radius:50%}
+    .reticle .line{position:absolute;background:rgba(255,255,255,0.35)}
+    .reticle .hl{left:50%;top:6%;width:1px;height:12%;transform:translateX(-50%)}
+    .reticle .vl{top:50%;left:6%;height:1px;width:12%;transform:translateY(-50%)}
+    .loading{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);color:#ddd;background:rgba(0,0,0,0.55);padding:10px 14px;border-radius:8px;font-family:system-ui}
+  </style>
+</head>
+<body>
+  <div id="container">
+    <canvas id="view" width="1200" height="900" aria-label="Optical zoom viewer"></canvas>
+    <div class="reticle">
+      <div class="line hl"></div>
+      <div class="line vl"></div>
+    </div>
+    <div class="tip">Mouse wheel / slider / A-D keys to zoom</div>
+    <div class="controls" aria-hidden>
+      <div class="label">Zoom</div>
+      <input id="zoomRange" type="range" min="1" max="8" step="0.01" value="1">
+      <div class="label" id="zoomValue">1.00x</div>
+    </div>
+    <div class="loading" id="loading">Loading images…</div>
+  </div>
 
+  <script>
+  // Configuration: list available source images and their nominal magnifications.
+  // If some files are missing (e.g. 1.png), the viewer will still work with the available set.
+  const sources = [
+    {src:'1.png', level:1},
+    {src:'2.png', level:2},
+    {src:'4.png', level:4},
+    {src:'8.png', level:8}
+  ];
+
+  const canvas = document.getElementById('view');
+  const ctx = canvas.getContext('2d');
+
+  function fitCanvas(){
+    const rect = canvas.getBoundingClientRect();
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.round(rect.width * dpr);
+    canvas.height = Math.round(rect.height * dpr);
+  }
+  fitCanvas();
+  window.addEventListener('resize', ()=>{ fitCanvas(); });
+
+  // State
+  const imgs = new Array(sources.length).fill(null);
+  let loadedCount = 0;
+  let ready = false;
+  let referenceIndex = 0; // index of lowest-level image loaded used for alignment
+  const offsets = new Array(sources.length).fill({x:0,y:0});
+
+  // Load images (best-effort); missing files will be skipped
+  sources.forEach((s,i)=>{
+    const img = new Image();
+    img.src = s.src;
+    img.crossOrigin = 'anonymous';
+    img.onload = ()=>{ imgs[i] = img; loadedCount++; checkAllLoaded(); };
+    img.onerror = ()=>{ console.warn('Image missing or failed to load:', s.src); loadedCount++; checkAllLoaded(); };
+  });
+
+  function checkAllLoaded(){
+    if(loadedCount !== sources.length) return;
+    // filter to available images
+    const available = sources.map((s,i)=> ({...s, img: imgs[i], index:i})).filter(s=>s.img);
+    if(available.length === 0){ document.getElementById('loading').textContent = 'No images found. Add 1.png/2.png/4.png/8.png next to index.html.'; return; }
+    // choose lowest magnification image among available as reference
+    const minLevel = Math.min(...available.map(s=>s.level));
+    referenceIndex = available.find(s=>s.level === minLevel).index;
+    // compute offsets relative to reference
+    (async ()=>{
+      for(const a of available){
+        if(a.index === referenceIndex) { offsets[a.index] = {x:0,y:0}; continue; }
+        offsets[a.index] = await computeOffset(imgs[referenceIndex], imgs[a.index]);
+      }
+      // hide loader and enable controls
+      document.getElementById('loading').style.display='none';
+      setupControls(available.map(s=>s.level));
+      ready = true;
+    })();
+  }
+
+  // Alignment: low-res bruteforce search with reduced image to keep it fast and tolerant to AI-generated misalignments
+  async function computeOffset(baseImg, otherImg){
+    // downsample both to a small matching size
+    const targetW = 300;
+    const base = downsampleImage(baseImg, targetW);
+    const other = downsampleImage(otherImg, targetW);
+    const maxShift = Math.round(Math.max(base.w, base.h) * 0.06) + 18; // allow ~6% + padding
+    const gB = grayArray(base.ctx, base.w, base.h);
+    const gO = grayArray(other.ctx, other.w, other.h);
+    let best = {x:0,y:0,score:Infinity};
+    // search with step to be fast; refine later
+    for(let step of [6,4,2,1]){
+      const startX = best.x - step*6; const endX = best.x + step*6;
+      const startY = best.y - step*6; const endY = best.y + step*6;
+      for(let dy=startY; dy<=endY; dy+=step){
+        for(let dx=startX; dx<=endX; dx+=step){
+          if(Math.abs(dx) > maxShift || Math.abs(dy) > maxShift) continue;
+          let s=0,cnt=0;
+          for(let y=0;y<base.h;y+=3){
+            for(let x=0;x<base.w;x+=3){
+              const ox = x+dx; const oy = y+dy;
+              if(ox<0||oy<0||ox>=other.w||oy>=other.h) continue;
+              const a = gB[y*base.w + x];
+              const b = gO[oy*other.w + ox];
+              const d = a-b; s += d*d; cnt++;
+            }
+          }
+          if(cnt>0) s /= cnt; if(s < best.score) best = {x:dx,y:dy,score:s};
+        }
+      }
+    }
+    // scale offset back to full image pixels
+    const scaleX = baseImg.width / base.w; const scaleY = baseImg.height / base.h;
+    return {x: Math.round(best.x * scaleX), y: Math.round(best.y * scaleY)};
+  }
+
+  function downsampleImage(img, targetW){
+    const ratio = img.width / img.height;
+    const w = targetW;
+    const h = Math.max(20, Math.round(w / ratio));
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    const ct = c.getContext('2d'); ct.drawImage(img,0,0,w,h);
+    return {canvas:c,ctx:ct,w,h};
+  }
+
+  function grayArray(ctx, w, h){
+    const d = ctx.getImageData(0,0,w,h).data;
+    const arr = new Float32Array(w*h);
+    for(let i=0,j=0;i<d.length;i+=4,j++) arr[j] = (0.299*d[i]+0.587*d[i+1]+0.114*d[i+2]);
+    return arr;
+  }
+
+  // Controls & zoom state
+  const zoomRange = document.getElementById('zoomRange');
+  const zoomValue = document.getElementById('zoomValue');
+  let availableLevels = [1,2,4,8];
+  let minLevel = 1, maxLevel = 8;
+
+  let targetZoom = 1; let zoom = 1; // current displayed zoom
+  let focus = 0; // 0 = focused, 1 = fully out-of-focus
+  let isZooming = false;
+
+  function setupControls(levels){
+    availableLevels = levels.slice().sort((a,b)=>a-b);
+    minLevel = availableLevels[0]; maxLevel = availableLevels[availableLevels.length-1];
+    zoomRange.min = minLevel; zoomRange.max = maxLevel; zoomRange.step = 0.01; zoomRange.value = minLevel;
+    targetZoom = minLevel; zoom = minLevel;
+    zoomValue.textContent = zoom.toFixed(2)+'x';
+  }
+
+  zoomRange.addEventListener('input', e=>{ targetZoom = parseFloat(e.target.value); zoomValue.textContent = targetZoom.toFixed(2)+'x'; triggerZoom(); });
+  canvas.addEventListener('wheel', e=>{ e.preventDefault(); const delta = Math.sign(e.deltaY); targetZoom = clamp(targetZoom + delta * -0.18, minLevel, maxLevel); zoomRange.value = targetZoom; zoomValue.textContent = targetZoom.toFixed(2)+'x'; triggerZoom(); });
+  window.addEventListener('keydown', e=>{ if(e.key==='a'||e.key==='A'){ targetZoom = clamp(targetZoom-0.2,minLevel,maxLevel); zoomRange.value=targetZoom; zoomValue.textContent=targetZoom.toFixed(2)+'x'; triggerZoom(); } if(e.key==='d'||e.key==='D'){ targetZoom = clamp(targetZoom+0.2,minLevel,maxLevel); zoomRange.value=targetZoom; zoomValue.textContent=targetZoom.toFixed(2)+'x'; triggerZoom(); }});
+
+  function clamp(v,a,b){return Math.max(a,Math.min(b,v));}
+  function triggerZoom(){ isZooming = true; focus = 1.0; }
+
+  // Animation loop
+  let last = performance.now();
+  requestAnimationFrame(loop);
+  function loop(now){
+    const dt = Math.min(40, now - last); last = now;
+    // smooth exponential interpolation for zoom (feels optical)
+    const speed = 0.12; // higher = snappier
+    const diff = targetZoom - zoom;
+    zoom += diff * (1 - Math.pow(1-speed, Math.min(60,dt)));
+    if(Math.abs(diff) < 0.0005) zoom = targetZoom;
+
+    // focus dynamics: when zoom actively changing, set focus out; when settled, refocus
+    if(Math.abs(targetZoom - zoom) > 0.01) { focus = Math.min(1, focus + dt/120); } else { focus = Math.max(0, focus - dt/450); if(focus === 0) isZooming = false; }
+
+    if(ready) render();
+    requestAnimationFrame(loop);
+  }
+
+  // Rendering: blend nearest levels smoothly, apply blur during focus, vignette, dust, chromatic aberration
+  function render(){
+    const w = canvas.width, h = canvas.height; ctx.clearRect(0,0,w,h);
+    const cx = w/2, cy = h/2, radius = Math.min(w,h)*0.48;
+
+    // clip to circular scope
+    ctx.save(); ctx.beginPath(); ctx.arc(cx,cy,radius,0,Math.PI*2); ctx.closePath(); ctx.clip();
+
+    // background
+    ctx.fillStyle = '#050505'; ctx.fillRect(0,0,w,h);
+
+    // Decide blending: find surrounding levels in availableLevels
+    const L = availableLevels;
+    let loIdx = 0; while(loIdx < L.length-1 && zoom > L[loIdx+1]) loIdx++;
+    let hiIdx = Math.min(L.length-1, loIdx+1);
+    if(zoom <= L[0]) { loIdx = hiIdx = 0; }
+    const Llo = L[loIdx], Lhi = L[hiIdx];
+    const t = (Llo === Lhi) ? 0 : (zoom - Llo) / (Lhi - Llo);
+
+    // find actual source indexes for lo and hi
+    const srcLoIndex = sources.findIndex(s=>s.level===Llo);
+    const srcHiIndex = sources.findIndex(s=>s.level===Lhi);
+
+    // draw the higher-magnification image first (so lower mag can overlay slightly sharpened)
+    if(srcHiIndex >= 0 && imgs[srcHiIndex]) drawImageScaledBlended(imgs[srcHiIndex], sources[srcHiIndex].level, t, 1 - focus);
+    if(srcLoIndex >= 0 && imgs[srcLoIndex]) drawImageScaledBlended(imgs[srcLoIndex], sources[srcLoIndex].level, 1 - t, 1 - focus, true);
+
+    // mild chromatic fringe: composite offset layers with low alpha
+    applyChromaticFringe(zoom);
+
+    // vignette
+    const vg = ctx.createRadialGradient(cx,cy,radius*0.45,cx,cy,radius);
+    vg.addColorStop(0,'rgba(0,0,0,0)'); vg.addColorStop(1,'rgba(0,0,0,0.6)');
+    ctx.fillStyle = vg; ctx.fillRect(0,0,w,h);
+
+    // dust/grain overlay
+    drawGrain(0.035 * (0.8 + Math.random()*0.4));
+
+    ctx.restore();
+
+    // outside circle dark
+    ctx.save(); ctx.globalCompositeOperation='destination-over'; ctx.fillStyle='rgba(0,0,0,0.96)'; ctx.beginPath(); ctx.rect(0,0,w,h); ctx.arc(cx,cy,radius,0,Math.PI*2,true); ctx.closePath(); ctx.fill(); ctx.restore();
+  }
+
+  // Draw a source image scaled so that its nominal magnification matches the requested zoom.
+  // weight controls alpha blending; focusParam controls how blurred it should be (0 focused -> no blur, 1 -> max blur)
+  // 'sharpenOverlay' will draw a slight sharpening overlay for the lower-mag image to make it feel crisp after focus
+  function drawImageScaledBlended(img, imgLevel, weight, focusParam, sharpenOverlay=false){
+    const w = canvas.width, h = canvas.height, cx=w/2, cy=h/2;
+    // scale so that (zoom / imgLevel) is applied to the image. We also scale to fit canvas.
+    const fitScale = Math.min(w / img.width, h / img.height);
+    const s = (zoom / imgLevel) * fitScale;
+    const iw = img.width * s, ih = img.height * s;
+
+    // alignment offset (image-space -> canvas-space)
+    const off = offsets[sources.findIndex(s=>s.level===imgLevel)] || {x:0,y:0};
+    const dx = cx - iw/2 + off.x * s / (img.width / img.width); // off.x * s already in canvas px
+    const dy = cy - ih/2 + off.y * s / (img.height / img.height);
+
+    // blur during focus change
+    const maxBlur = 7 * (window.devicePixelRatio || 1);
+    const blurPx = focusParam * maxBlur;
+
+    ctx.save();
+    ctx.globalAlpha = clamp(weight, 0, 1);
+    ctx.filter = blurPx > 0.3 ? `blur(${blurPx}px) contrast(${1 - Math.min(0.08, focusParam*0.08)})` : `contrast(1)`;
+    ctx.drawImage(img, dx, dy, iw, ih);
+    ctx.restore();
+
+    // subtle sharpening overlay when focused to mimic autofocus crisping
+    if(!focusParam && sharpenOverlay){
+      ctx.save();
+      ctx.globalAlpha = 0.12; // light effect
+      ctx.filter = 'brightness(1.02) contrast(1.06)';
+      ctx.drawImage(img, dx, dy, iw, ih);
+      ctx.restore();
+    }
+  }
+
+  function applyChromaticFringe(z){
+    // cheap chromatic fringing by drawing faint shifted copies with 'screen' blending
+    const w=canvas.width,h=canvas.height; const amount = ((z - minLevel) / (maxLevel - minLevel)) * 2.5; // up to ~2.5px
+    if(amount <= 0.01) return;
+    const tmp = document.createElement('canvas'); tmp.width = w; tmp.height = h; const tctx = tmp.getContext('2d');
+    // capture current scope area
+    tctx.drawImage(canvas, 0, 0);
+    // red shift
+    ctx.save(); ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = 0.035; ctx.drawImage(tmp, amount, 0); ctx.restore();
+    // blue shift
+    ctx.save(); ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = 0.03; ctx.drawImage(tmp, -amount*0.8, 0); ctx.restore();
+  }
+
+  function drawGrain(opacity){
+    const w=canvas.width,h=canvas.height; ctx.save(); ctx.globalCompositeOperation='overlay';
+    // gradient to simulate light falloff
+    const g = ctx.createRadialGradient(w/2,h/2,0,w/2,h/2,Math.max(w,h)/1.2);
+    g.addColorStop(0,'rgba(255,255,255,'+(0.0015*opacity)+')'); g.addColorStop(1,'rgba(0,0,0,'+(0.006*opacity)+')');
+    ctx.fillStyle=g; ctx.fillRect(0,0,w,h);
+    // grain
+    ctx.globalAlpha = opacity*0.6;
+    for(let i=0;i<Math.floor(w*h*0.00005);i++){ const x=Math.random()*w,y=Math.random()*h; ctx.fillStyle = Math.random()<0.5 ? 'rgba(255,255,255,0.02)' : 'rgba(0,0,0,0.02)'; ctx.fillRect(x,y,1,1); }
+    ctx.restore();
+  }
+
+  // initial black screen until ready
+  ctx.fillStyle='#000'; ctx.fillRect(0,0,canvas.width,canvas.height);
+
+  // done
+  </script>
+</body>
+</html>
